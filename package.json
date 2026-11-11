@@ -52,6 +52,10 @@
     "test": "vitest run",
     "test:dev": "vitest",
     "test:coverage": "vitest run --coverage",
+    "bench:generate": "node --import tsx bench/generate-long-header.ts",
+    "bench:time": "node --expose-gc --import tsx bench/time-long-header.ts",
+    "bench:memory": "node --expose-gc --import tsx bench/memory-long-header.ts",
+    "golden:generate": "node --import tsx bench/generate-sample-golden.ts",
     "lint": "eslint",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
@@ -72,6 +76,7 @@
     "prettier": "^3.9.10",
     "tar": "^7.5.22",
     "tsdown": "^0.23.2",
+    "tsx": "^4.23.15",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.72.0",
     "vitest": "^5.0.5"

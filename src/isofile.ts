@@ -100,6 +100,29 @@ import type {
 } from '@types';
 import { MP4BoxBuffer } from '#/mp4boxbuffer';
 import { parseOneBox } from '#/parser';
+import {
+  FIELD_ALREADY_READ,
+  FIELD_CHUNK_INDEX,
+  FIELD_CHUNK_RUN_INDEX,
+  FIELD_CTS,
+  FIELD_DEGRADATION_PRIORITY,
+  FIELD_DEPENDS_ON,
+  FIELD_DESCRIPTION_INDEX,
+  FIELD_DTS,
+  FIELD_DURATION,
+  FIELD_HAS_REDUNDANCY,
+  FIELD_IS_DEPENDED_ON,
+  FIELD_IS_LEADING,
+  FIELD_IS_SYNC,
+  FIELD_NUMBER,
+  FIELD_OFFSET,
+  FIELD_SIZE,
+  FIELD_TIMESCALE,
+  FIELD_TRACK_ID,
+  SampleColumnStore,
+  SampleList,
+  createSampleList,
+} from '#/sample-list';
 
 export class SampleGroupInfo {
   last_sample_in_run = -1;
@@ -1661,7 +1684,8 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
     let offset_in_chunk: number;
     let last_sample_in_chunk: number;
 
-    trak.samples = [];
+    const samples = new SampleList();
+    trak.samples = samples as unknown as Array<Sample>;
     trak.samples_duration = 0;
     trak.samples_size = 0;
 
@@ -1691,17 +1715,185 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
       return;
     }
 
+    const sampleCount = stsz.sample_sizes.length;
+    const sampleSizes = stsz.sample_sizes;
+    const trackId = trak.tkhd.track_id;
+    const timescale = trak.mdia.mdhd.timescale;
+    const sdtp = trak.mdia.minf.stbl.sdtp;
+    const chunkOffsets = stco.chunk_offsets;
+    const stscFirstChunk = stsc.first_chunk;
+    const stscSamplesPerChunk = stsc.samples_per_chunk;
+    const stscDescriptionIndex = stsc.sample_description_index;
+    const sttsCounts = stts.sample_counts;
+    const sttsDeltas = stts.sample_deltas;
+    const cttsCounts = ctts ? ctts.sample_counts : undefined;
+    const cttsOffsets = ctts ? ctts.sample_offsets : undefined;
+    const stssNumbers = stss ? stss.sample_numbers : undefined;
+    const stdpPriorities = stdp ? stdp.priority : undefined;
+    const hasSampleGroups = sbgps.length > 0 || sgpds.length > 0;
+
+    /*
+     * Fast path: the common feature-length layout (constant one-sample-per-
+     * chunk runs, no subsample boxes, no sample groups, no sdtp/stdp tables)
+     * can be resolved with run-based arithmetic directly into flat column
+     * arrays, without allocating one object literal per sample.
+     */
+    const singleRun =
+      stscFirstChunk.length === 1 &&
+      stscFirstChunk[0] === 1 &&
+      stscSamplesPerChunk[0] === 1 &&
+      stscDescriptionIndex[0] >= 1 &&
+      !subs &&
+      !hasSampleGroups &&
+      !sdtp &&
+      !stdp &&
+      sampleCount > 0 &&
+      chunkOffsets.length >= sampleCount;
+
+    if (singleRun) {
+      /*
+       * Column-oriented fast path: all scalar sample properties are written
+       * directly into flat typed arrays. No per-sample JavaScript object is
+       * allocated here; samples materialize lazily when external code reads
+       * trak.samples[n].
+       */
+      const store = new SampleColumnStore(sampleCount);
+      trak.samples = createSampleList(store) as unknown as Array<Sample>;
+
+      const sizeCol = store.columns[FIELD_SIZE];
+      const offsetCol = store.columns[FIELD_OFFSET];
+      const dtsCol = store.columns[FIELD_DTS];
+      const ctsCol = store.columns[FIELD_CTS];
+      const durationCol = store.columns[FIELD_DURATION];
+      const chunkIndexCol = store.columns[FIELD_CHUNK_INDEX];
+      const chunkRunIndexCol = store.columns[FIELD_CHUNK_RUN_INDEX];
+      const descriptionIndexCol = store.columns[FIELD_DESCRIPTION_INDEX];
+      const degradationCol = store.columns[FIELD_DEGRADATION_PRIORITY];
+      const numberCol = store.columns[FIELD_NUMBER];
+      const trackIdCol = store.columns[FIELD_TRACK_ID];
+      const timescaleCol = store.columns[FIELD_TIMESCALE];
+      const syncCol = store.columns[FIELD_IS_SYNC];
+      const leadingCol = store.columns[FIELD_IS_LEADING];
+      const dependsCol = store.columns[FIELD_DEPENDS_ON];
+      const dependedCol = store.columns[FIELD_IS_DEPENDED_ON];
+      const redundancyCol = store.columns[FIELD_HAS_REDUNDANCY];
+      const alreadyReadCol = store.columns[FIELD_ALREADY_READ];
+
+      const descriptionIndex = stscDescriptionIndex[0] - 1;
+      store.descriptions[0] = stsd.entries[descriptionIndex];
+      const hasCtts = ctts !== undefined;
+      const hasStss = stss !== undefined;
+      // Key enumeration order is resolved per materialized sample based on
+      // the sync flag; only the presence of an stss box is needed here.
+      store.hasStss = hasStss;
+
+      /* Constant columns are initialized in bulk; the fused loop below only
+       * writes the per-sample varying columns. TypedArray.fill() is a single
+       * native memset per column and avoids 10 stores on every iteration. */
+      chunkRunIndexCol.fill(0);
+      descriptionIndexCol.fill(descriptionIndex);
+      degradationCol.fill(0);
+      trackIdCol.fill(trackId);
+      timescaleCol.fill(timescale);
+      leadingCol.fill(0);
+      dependsCol.fill(0);
+      dependedCol.fill(0);
+      redundancyCol.fill(0);
+      alreadyReadCol.fill(0);
+      if (!hasStss) {
+        syncCol.fill(1);
+      }
+
+      /*
+       * Single fused pass over every sample: stts / ctts / stss runs are
+       * advanced with cursors and only the varying columns are touched, so
+       * the whole sample table is built in one array traversal.
+       */
+      let totalSize = 0;
+      let totalDuration = 0;
+      let sttsLastSample = -1;
+      let sttsIndex = -1;
+      let cttsLastSample = -1;
+      let cttsIndex = -1;
+      let stssCursor = 0;
+      let dts = 0;
+
+      for (j = 0; j < sampleCount; j++) {
+        const size = sampleSizes[j];
+        totalSize += size;
+
+        // stts run advancement, identical boundary semantics to the generic
+        // path (including zero-count runs).
+        if (j > sttsLastSample) {
+          sttsIndex++;
+          if (sttsLastSample < 0) {
+            sttsLastSample = 0;
+          }
+          sttsLastSample += sttsCounts[sttsIndex];
+        }
+        const delta = sttsDeltas[sttsIndex];
+        if (j > 0) {
+          // Look-ahead assignment of the previous sample's duration.
+          durationCol[j - 1] = delta;
+          totalDuration += delta;
+          dts += delta;
+        }
+        dtsCol[j] = dts;
+
+        // ctts run advancement (zero-count runs stay unconsumed, as before).
+        if (hasCtts) {
+          if (j >= cttsLastSample) {
+            cttsIndex++;
+            if (cttsLastSample < 0) {
+              cttsLastSample = 0;
+            }
+            cttsLastSample += cttsCounts[cttsIndex];
+          }
+          ctsCol[j] = dts + cttsOffsets[cttsIndex];
+        } else {
+          ctsCol[j] = dts;
+        }
+
+        // sync flag from stss (sample numbers are 1-based)
+        if (hasStss) {
+          if (stssCursor < stssNumbers.length && j === stssNumbers[stssCursor] - 1) {
+            syncCol[j] = 1;
+            stssCursor++;
+          }
+        }
+
+        sizeCol[j] = size;
+        offsetCol[j] = chunkOffsets[j];
+        chunkIndexCol[j] = j + 1;
+        numberCol[j] = j;
+      }
+
+      /* Last sample duration is recomputed from the media header, exactly as
+       * the generic path does after the loop. */
+      if (sampleCount > 0) {
+        const lastIndex = sampleCount - 1;
+        const corrected = Math.max(trak.mdia.mdhd.duration - dtsCol[lastIndex], 0);
+        totalDuration += corrected - durationCol[lastIndex];
+        durationCol[lastIndex] = corrected;
+      }
+
+      trak.samples_size = totalSize;
+      trak.samples_duration = totalDuration;
+      return;
+    }
+
+    /* Generic path: preserves the original per-sample construction logic. */
     /* we build the samples one by one and compute their properties */
-    for (j = 0; j < stsz.sample_sizes.length; j++) {
+    for (j = 0; j < sampleCount; j++) {
       const sample = {
         number: j,
-        track_id: trak.tkhd.track_id,
-        timescale: trak.mdia.mdhd.timescale,
+        track_id: trackId,
+        timescale,
         alreadyRead: 0,
-        size: stsz.sample_sizes[j],
+        size: sampleSizes[j],
       } as Sample;
 
-      trak.samples[j] = sample;
+      samples[j] = sample;
       /* size can be known directly */
       trak.samples_size += sample.size;
       /* computing chunk-based properties (offset, sample description index)*/
@@ -1710,13 +1902,13 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
         chunk_run_index = 0; /* the first chunk is the first entry in the first_chunk table */
         sample.chunk_index = chunk_index;
         sample.chunk_run_index = chunk_run_index;
-        last_sample_in_chunk = stsc.samples_per_chunk[chunk_run_index];
+        last_sample_in_chunk = stscSamplesPerChunk[chunk_run_index];
         offset_in_chunk = 0;
 
         /* Is there another entry in the first_chunk table ? */
-        if (chunk_run_index + 1 < stsc.first_chunk.length) {
+        if (chunk_run_index + 1 < stscFirstChunk.length) {
           /* The last chunk in the run is the chunk before the next first chunk */
-          last_chunk_in_run = stsc.first_chunk[chunk_run_index + 1] - 1;
+          last_chunk_in_run = stscFirstChunk[chunk_run_index + 1] - 1;
         } else {
           /* There is only one entry in the table, it is valid for all future chunks*/
           last_chunk_in_run = Infinity;
@@ -1738,24 +1930,23 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
           } else {
             chunk_run_index++;
             /* Is there another entry in the first_chunk table ? */
-            if (chunk_run_index + 1 < stsc.first_chunk.length) {
+            if (chunk_run_index + 1 < stscFirstChunk.length) {
               /* The last chunk in the run is the chunk before the next first chunk */
-              last_chunk_in_run = stsc.first_chunk[chunk_run_index + 1] - 1;
+              last_chunk_in_run = stscFirstChunk[chunk_run_index + 1] - 1;
             } else {
               /* There is only one entry in the table, it is valid for all future chunks*/
               last_chunk_in_run = Infinity;
             }
           }
           sample.chunk_run_index = chunk_run_index;
-          last_sample_in_chunk += stsc.samples_per_chunk[chunk_run_index];
+          last_sample_in_chunk += stscSamplesPerChunk[chunk_run_index];
         }
       }
 
-      sample.description_index = stsc.sample_description_index[sample.chunk_run_index] - 1;
+      sample.description_index = stscDescriptionIndex[sample.chunk_run_index] - 1;
       sample.description = stsd.entries[sample.description_index];
       sample.offset =
-        stco.chunk_offsets[sample.chunk_index - 1] +
-        offset_in_chunk; /* chunk indexes are 1-based */
+        chunkOffsets[sample.chunk_index - 1] + offset_in_chunk; /* chunk indexes are 1-based */
       offset_in_chunk += sample.size;
 
       /* setting dts, cts, duration and rap flags */
@@ -1764,12 +1955,12 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
         if (last_sample_in_stts_run < 0) {
           last_sample_in_stts_run = 0;
         }
-        last_sample_in_stts_run += stts.sample_counts[stts_run_index];
+        last_sample_in_stts_run += sttsCounts[stts_run_index];
       }
       if (j > 0) {
-        trak.samples[j - 1].duration = stts.sample_deltas[stts_run_index];
-        trak.samples_duration += trak.samples[j - 1].duration;
-        sample.dts = trak.samples[j - 1].dts + trak.samples[j - 1].duration;
+        samples[j - 1].duration = sttsDeltas[stts_run_index];
+        trak.samples_duration += samples[j - 1].duration;
+        sample.dts = samples[j - 1].dts + samples[j - 1].duration;
       } else {
         sample.dts = 0;
       }
@@ -1779,14 +1970,14 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
           if (last_sample_in_ctts_run < 0) {
             last_sample_in_ctts_run = 0;
           }
-          last_sample_in_ctts_run += ctts.sample_counts[ctts_run_index];
+          last_sample_in_ctts_run += cttsCounts[ctts_run_index];
         }
-        sample.cts = trak.samples[j].dts + ctts.sample_offsets[ctts_run_index];
+        sample.cts = samples[j].dts + cttsOffsets[ctts_run_index];
       } else {
         sample.cts = sample.dts;
       }
       if (stss) {
-        if (j === stss.sample_numbers[last_stss_index] - 1) {
+        if (j === stssNumbers[last_stss_index] - 1) {
           // sample numbers are 1-based
           sample.is_sync = true;
           last_stss_index++;
@@ -1804,9 +1995,9 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
       } else {
         sample.is_sync = true;
       }
-      ISOFile.process_sdtp(trak.mdia.minf.stbl.sdtp, sample, sample.number);
+      ISOFile.process_sdtp(sdtp, sample, sample.number);
       if (stdp) {
-        sample.degradation_priority = stdp.priority[j];
+        sample.degradation_priority = stdpPriorities[j];
       } else {
         sample.degradation_priority = 0;
       }
@@ -1816,13 +2007,13 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
           last_subs_sample_index += subs.entries[subs_entry_index].sample_delta;
         }
       }
-      if (sbgps.length > 0 || sgpds.length > 0) {
+      if (hasSampleGroups) {
         ISOFile.setSampleGroupProperties(trak, sample, j, trak.sample_groups_info);
       }
     }
     if (j > 0) {
-      trak.samples[j - 1].duration = Math.max(trak.mdia.mdhd.duration - trak.samples[j - 1].dts, 0);
-      trak.samples_duration += trak.samples[j - 1].duration;
+      samples[j - 1].duration = Math.max(trak.mdia.mdhd.duration - samples[j - 1].dts, 0);
+      trak.samples_duration += samples[j - 1].duration;
     }
   }
 

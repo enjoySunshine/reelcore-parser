@@ -7,6 +7,6 @@
     "resolveJsonModule": true,
     "types": ["vitest/globals", "node"]
   },
-  "include": ["./tests/**/*"],
+  "include": ["./tests/**/*", "./bench/golden-snapshot.ts"],
   "references": [{ "path": "./tsconfig.lib.json" }]
 }
